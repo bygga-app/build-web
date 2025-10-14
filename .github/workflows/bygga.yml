@@ -1,0 +1,284 @@
+name: Bygga
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: '指定运行的操作系统环境'
+        required: false
+        default: 'ubuntu-latest'
+      repo_owner:
+        description: 'GitHub 用户名或组织名'
+        required: true
+      repo_name:
+        description: '仓库名称'
+        required: true
+      branch:
+        description: '要检出的分支'
+        required: true
+        default: 'main'
+      commands:
+        description: '执行命令（用分号 ; 分隔）'
+        required: true
+        default: 'bun run build'
+      output_paths:
+        description: '输出路径（用分号 ; 分隔）'
+        required: true
+        default: 'dist'
+      compress_artifacts:
+        description: '是否压缩输出'
+        required: false
+        default: 'false'
+      env_vars:
+        description: '【加密】环境变量密文（decrypt-env.ts 可识别的密文字符串）'
+        required: false
+      gh_token:
+        description: '（可选）用于克隆/解密的 GitHub Token，留空将回退到变量或 github.token'
+        required: false
+        default: ''
+      callback_url:
+        description: '（可选）回调通知地址，结束后将以 POST JSON 调用'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+
+    env:
+      GH_TOKEN: ${{ inputs.gh_token != '' && inputs.gh_token || env.GH_TOKEN || vars.GH_TOKEN || github.token }}
+
+    steps:
+    - name: 记录开始时间
+      run: |
+        START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        echo "RUN_STARTED_AT=$START_TIME" >> $GITHUB_ENV
+
+    - name: 检出构建工具仓库
+      uses: actions/checkout@v4
+
+    - name: 克隆目标项目
+      run: |
+        if [ -n "${GH_TOKEN}" ]; then
+          echo "::add-mask::${GH_TOKEN}"
+        fi
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+
+        REPO_URL="https://github.com/${{ github.event.inputs.repo_owner }}/${{ github.event.inputs.repo_name }}.git"
+
+        if [ -n "${GH_TOKEN}" ]; then
+          REPO_WITH_AUTH=$(echo "$REPO_URL" | sed -E "s#https://#https://${GH_TOKEN}@#")
+          echo "正在克隆（带认证）: ${{ github.event.inputs.repo_owner }}/${{ github.event.inputs.repo_name }} ..."
+          git clone -q "$REPO_WITH_AUTH" target-project
+          unset REPO_WITH_AUTH
+        else
+          echo "未提供 GH_TOKEN，将以匿名方式克隆（仅公共仓库）: ${{ github.event.inputs.repo_owner }}/${{ github.event.inputs.repo_name }} ..."
+          git clone -q "$REPO_URL" target-project
+        fi
+
+        cd target-project
+        git checkout ${{ github.event.inputs.branch }}
+
+    - name: 安装 Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: 显示 Bun 版本
+      run: bun --version
+
+    - name: 安装工作流依赖
+      run: |
+        echo "安装工作流所需的依赖包..."
+        bun add crypto-js child_process
+
+    - name: 安装依赖
+      working-directory: target-project
+      run: |
+        echo "使用 Bun 安装依赖..."
+        bun install
+
+    - name: 解密并设置环境变量
+      if: ${{ github.event.inputs.env_vars != '' }}
+      working-directory: target-project
+      run: |
+        echo "解密环境变量..."
+        ENV_FILE=".env"
+        TEMP_ENV_FILE=$(mktemp)
+
+        bun $GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts "${{ github.event.inputs.env_vars }}" "${GH_TOKEN}" "$TEMP_ENV_FILE"
+        if [ $? -ne 0 ]; then
+          echo "环境变量解密失败"
+          exit 1
+        fi
+
+        cat "$TEMP_ENV_FILE" >> $GITHUB_ENV
+        cat "$TEMP_ENV_FILE" > "$ENV_FILE"
+        echo "已成功解密并设置环境变量"
+        rm "$TEMP_ENV_FILE"
+
+    - name: 执行命令（分号分隔）
+      working-directory: target-project
+      shell: bash
+      run: |
+        echo "执行命令（以 ; 分隔）..."
+        CURRENT_DIR=$(pwd)
+        CMDS_STR=$(printf '%s' "${{ github.event.inputs.commands }}" | tr -d '\r')
+        IFS=';' read -ra COMMANDS <<< "$CMDS_STR"
+        for cmd in "${COMMANDS[@]}"; do
+          cmd="$(echo "$cmd" | xargs)"
+          [ -z "$cmd" ] && continue
+          echo "执行: $cmd"
+          cd "$CURRENT_DIR" && bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd" "$CURRENT_DIR"
+          if [ $? -ne 0 ]; then
+            echo "命令执行失败: $cmd"
+            exit 1
+          fi
+        done
+        echo "所有命令已成功执行"
+
+    - name: 处理输出（分号分隔）
+      working-directory: target-project
+      shell: bash
+      run: |
+        echo "处理输出（以 ; 分隔）..."
+        sudo apt-get update && sudo apt-get install -y zip
+
+        PATHS_STR=$(printf '%s' "${{ github.event.inputs.output_paths }}" | tr -d '\r')
+        IFS=';' read -ra PATHS <<< "$PATHS_STR"
+
+        ARTIFACTS_LIST=""
+        CLEANED_LINES=""
+        for item in "${PATHS[@]}"; do
+          item="$(echo "$item" | xargs)"
+          [ -z "$item" ] && continue
+          if [ -z "$ARTIFACTS_LIST" ]; then
+            ARTIFACTS_LIST="$item"
+          else
+            ARTIFACTS_LIST="$ARTIFACTS_LIST $item"
+          fi
+          CLEANED_LINES="${CLEANED_LINES}${item}"
+        done
+
+        TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+        ZIP_FILE="build-$TIMESTAMP.zip"
+
+        if [[ "${{ github.event.inputs.compress_artifacts }}" == "true" ]]; then
+          echo "将以下路径打包到 $ZIP_FILE:"
+          printf '%s\n' "$CLEANED_LINES"
+          zip -r "$ZIP_FILE" $ARTIFACTS_LIST
+          echo "ARTIFACT_PATH=$ZIP_FILE" >> $GITHUB_ENV
+          echo "ARTIFACT_NAME=build-$TIMESTAMP" >> $GITHUB_ENV
+        else
+          echo "不压缩，使用原始路径上传输出"
+          echo "ARTIFACT_NAME=build-$TIMESTAMP" >> $GITHUB_ENV
+          {
+            echo "ARTIFACT_PATHS<<EOF"
+            printf '%s' "$CLEANED_LINES"
+            echo "EOF"
+          } >> $GITHUB_ENV
+        fi
+
+    - name: 上传压缩输出
+      uses: actions/upload-artifact@v4
+      if: ${{ github.event.inputs.compress_artifacts == 'true' }}
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: target-project/${{ env.ARTIFACT_PATH }}
+        if-no-files-found: error
+
+    - name: 上传未压缩输出
+      uses: actions/upload-artifact@v4
+      if: ${{ github.event.inputs.compress_artifacts != 'true' }}
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: |
+          ${{ env.ARTIFACT_PATHS }}
+        path-pattern: "target-project/{0}"
+        if-no-files-found: error
+
+    - name: 结束通知
+      run: |
+        echo "您可以在 GitHub Actions 运行页面的 'Artifacts' 部分下载输出"
+        echo "输出（原始输入，; 分隔）：${{ github.event.inputs.output_paths }}"
+        if [[ "${{ github.event.inputs.compress_artifacts }}" == "true" ]]; then
+          echo "输出已压缩为 ZIP 文件"
+        else
+          echo "输出以原始目录结构上传"
+        fi
+
+    - name: 回调通知
+      if: ${{ always() && inputs.callback_url != '' }}
+      shell: bash
+      env:
+        CALLBACK_URL: ${{ inputs.callback_url }}
+        JOB_STATUS: ${{ job.status }} # success | failure | cancelled
+      run: |
+        echo "发送回调到: ${CALLBACK_URL}"
+
+        FINISH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        # 计算耗时（秒）
+        start_ts=$(date -u -d "${RUN_STARTED_AT}" +%s 2>/dev/null || echo 0)
+        end_ts=$(date -u -d "${FINISH_TIME}" +%s)
+        if [ "$start_ts" -gt 0 ]; then
+          DURATION_SEC=$(( end_ts - start_ts ))
+        else
+          DURATION_SEC=0
+        fi
+
+        # 组装 JSON 负载
+        payload=$(
+          jq -n \
+            --arg workflow "${{ github.workflow }}" \
+            --arg job "build" \
+            --arg status "${JOB_STATUS}" \
+            --arg repo_owner "${{ github.event.inputs.repo_owner }}" \
+            --arg repo_name "${{ github.event.inputs.repo_name }}" \
+            --arg branch "${{ github.event.inputs.branch }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_number "${{ github.run_number }}" \
+            --arg run_attempt "${{ github.run_attempt }}" \
+            --arg artifact_name "${ARTIFACT_NAME:-}" \
+            --arg artifact_path "${ARTIFACT_PATH:-}" \
+            --arg output_paths_input "${{ github.event.inputs.output_paths }}" \
+            --arg compress "${{ github.event.inputs.compress_artifacts }}" \
+            --arg started_at "${RUN_STARTED_AT:-}" \
+            --arg finished_at "${FINISH_TIME}" \
+            --arg duration_sec "${DURATION_SEC}" \
+            '{
+              workflow: $workflow,
+              job: $job,
+              status: $status,
+              repository: { owner: $repo_owner, name: $repo_name, branch: $branch },
+              run: { id: $run_id, number: $run_number, attempt: $run_attempt },
+              artifacts: {
+                name: $artifact_name,
+                compressed_path: ($artifact_path // null),
+                output_paths_input: $output_paths_input,
+                compress_artifacts: $compress
+              },
+              timing: { started_at: $started_at, finished_at: $finished_at, duration_sec: ($duration_sec|tonumber) }
+            }'
+        )
+
+        echo "回调载荷："
+        echo "$payload" | jq .
+
+        # 发送 POST（期望 2xx）
+        http_code=$(
+          curl -sS -o /tmp/callback_resp.txt -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -X POST "${CALLBACK_URL}" \
+            --data "$payload"
+        )
+
+        echo "回调响应码: $http_code"
+        echo "回调响应体:"
+        cat /tmp/callback_resp.txt || true
+
+        # 不因回调失败而使 Job 失败，但打印警告
+        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+          echo "::warning::回调返回非 2xx 状态码: ${http_code}"
+        fi
