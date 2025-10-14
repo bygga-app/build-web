@@ -32,8 +32,8 @@ on:
       env_vars:
         description: '【加密】环境变量密文（decrypt-env.ts 可识别的密文字符串）'
         required: false
-      gh_token:
-        description: '（可选）用于克隆/解密的 GitHub Token，留空将回退到变量或 github.token'
+      github_token:
+        description: 'Base64 编码的 GitHub Token（不回退，留空则不使用令牌）'
         required: false
         default: ''
       callback_url:
@@ -45,9 +45,6 @@ jobs:
   build:
     runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
 
-    env:
-      GH_TOKEN: ${{ inputs.gh_token != '' && inputs.gh_token || env.GH_TOKEN || vars.GH_TOKEN || github.token }}
-
     steps:
     - name: 记录开始时间
       run: |
@@ -57,7 +54,34 @@ jobs:
     - name: 检出构建工具仓库
       uses: actions/checkout@v4
 
+    - name: 解析 github_token（Base64）为 GH_TOKEN（无任何回退）
+      shell: bash
+      env:
+        INPUT_GITHUB_TOKEN_B64: ${{ inputs.github_token }}
+      run: |
+        set -e
+        if [[ -n "${INPUT_GITHUB_TOKEN_B64}" ]]; then
+          cleaned=$(printf '%s' "${INPUT_GITHUB_TOKEN_B64}" | tr -d '\r\n ')
+          if decoded=$(printf '%s' "$cleaned" | base64 -d 2>/dev/null); then
+            if [[ -n "$decoded" ]]; then
+              echo "::add-mask::$decoded"
+              echo "GH_TOKEN=$decoded" >> "$GITHUB_ENV"
+            else
+              echo "::warning::提供的 github_token Base64 解码后为空，未设置 GH_TOKEN。"
+            fi
+          else
+            echo "::warning::提供的 github_token 不是有效的 Base64 字符串，未设置 GH_TOKEN。"
+          fi
+        else
+          echo "未提供 github_token，未设置 GH_TOKEN（将以匿名方式克隆公共仓库）。"
+        fi
+
     - name: 克隆目标项目
+      shell: bash
+      env:
+        REPO_OWNER: ${{ github.event.inputs.repo_owner }}
+        REPO_NAME: ${{ github.event.inputs.repo_name }}
+        BRANCH: ${{ github.event.inputs.branch }}
       run: |
         if [ -n "${GH_TOKEN}" ]; then
           echo "::add-mask::${GH_TOKEN}"
@@ -65,20 +89,20 @@ jobs:
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
 
-        REPO_URL="https://github.com/${{ github.event.inputs.repo_owner }}/${{ github.event.inputs.repo_name }}.git"
+        REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 
         if [ -n "${GH_TOKEN}" ]; then
           REPO_WITH_AUTH=$(echo "$REPO_URL" | sed -E "s#https://#https://${GH_TOKEN}@#")
-          echo "正在克隆（带认证）: ${{ github.event.inputs.repo_owner }}/${{ github.event.inputs.repo_name }} ..."
+          echo "正在克隆（带认证）: ${REPO_OWNER}/${REPO_NAME} ..."
           git clone -q "$REPO_WITH_AUTH" target-project
           unset REPO_WITH_AUTH
         else
-          echo "未提供 GH_TOKEN，将以匿名方式克隆（仅公共仓库）: ${{ github.event.inputs.repo_owner }}/${{ github.event.inputs.repo_name }} ..."
+          echo "未设置 GH_TOKEN，将以匿名方式克隆（仅公共仓库）: ${REPO_OWNER}/${REPO_NAME} ..."
           git clone -q "$REPO_URL" target-project
         fi
 
         cd target-project
-        git checkout ${{ github.event.inputs.branch }}
+        git checkout "${BRANCH}"
 
     - name: 安装 Bun
       uses: oven-sh/setup-bun@v1
@@ -219,7 +243,6 @@ jobs:
 
         FINISH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-        # 计算耗时（秒）
         start_ts=$(date -u -d "${RUN_STARTED_AT}" +%s 2>/dev/null || echo 0)
         end_ts=$(date -u -d "${FINISH_TIME}" +%s)
         if [ "$start_ts" -gt 0 ]; then
@@ -228,7 +251,6 @@ jobs:
           DURATION_SEC=0
         fi
 
-        # 组装 JSON 负载
         payload=$(
           jq -n \
             --arg workflow "${{ github.workflow }}" \
@@ -266,7 +288,6 @@ jobs:
         echo "回调载荷："
         echo "$payload" | jq .
 
-        # 发送 POST（期望 2xx）
         http_code=$(
           curl -sS -o /tmp/callback_resp.txt -w "%{http_code}" \
             -H "Content-Type: application/json" \
@@ -278,7 +299,6 @@ jobs:
         echo "回调响应体:"
         cat /tmp/callback_resp.txt || true
 
-        # 不因回调失败而使 Job 失败，但打印警告
         if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
           echo "::warning::回调返回非 2xx 状态码: ${http_code}"
         fi
