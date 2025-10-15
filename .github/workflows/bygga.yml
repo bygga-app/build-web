@@ -4,42 +4,33 @@ on:
   workflow_dispatch:
     inputs:
       runs_on:
-        description: '指定运行的操作系统环境'
         required: false
         default: 'ubuntu-latest'
       repo_owner:
-        description: 'GitHub 用户名或组织名'
         required: true
       repo_name:
-        description: '仓库名称'
         required: true
       branch:
-        description: '要检出的分支'
         required: true
         default: 'main'
       commands:
-        description: '执行命令（用分号 ; 分隔）'
         required: true
         default: 'bun run build'
       output_paths:
-        description: '输出路径（用分号 ; 分隔）'
         required: true
         default: 'dist'
-      compress_artifacts:
-        description: '是否压缩输出'
-        required: false
-        default: 'false'
       env_vars:
-        description: '【加密】环境变量密文（decrypt-env.ts 可识别的密文字符串）'
         required: false
       github_token:
-        description: 'Base64 编码的 GitHub Token'
         required: false
         default: ''
       callback_url:
-        description: '回调通知地址（已自带 task_id 查询参数）'
         required: false
         default: ''
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   build:
@@ -48,79 +39,27 @@ jobs:
     steps:
     - name: 记录开始时间
       run: |
-        START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        echo "RUN_STARTED_AT=$START_TIME" >> $GITHUB_ENV
+        echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
-    - name: 安装工具（jq/zip）
+    - name: 安装工具
       shell: bash
       run: |
         sudo apt-get -qq update
         sudo apt-get -qq install -y jq zip >/dev/null
-
-    - name: 检出构建工具仓库
-      uses: actions/checkout@v4
-
-    - name: 准备 GH_TOKEN
-      shell: bash
-      run: |
         set -euo pipefail
-        raw_b64="${{ inputs.github_token }}"
-        if [[ -n "$raw_b64" ]]; then
-          cleaned=$(printf '%s' "$raw_b64" | tr -d '\r\n ')
-          echo "::add-mask::$cleaned"
-          decoded=$(printf '%s' "$cleaned" | base64 -d 2>/dev/null || true)
-          if [[ -n "$decoded" ]]; then
-            echo "::add-mask::$decoded"
-            printf 'GH_TOKEN=%s\n' "$decoded" >> "$GITHUB_ENV"
-            unset decoded
+        RAW="${{ inputs.github_token }}"
+        if [[ -n "$RAW" ]]; then
+          CLEAN=$(printf '%s' "$RAW" | tr -d '\r\n ')
+          echo "::add-mask::$CLEAN"
+          DEC=$(printf '%s' "$CLEAN" | base64 -d 2>/dev/null || true)
+          if [[ -n "$DEC" ]]; then
+            echo "::add-mask::$DEC"
+            printf 'GH_TOKEN=%s\n' "$DEC" >> "$GITHUB_ENV"
           fi
-          unset cleaned raw_b64
         fi
 
-    - name: 回调（开始：running）
-      if: ${{ inputs.callback_url != '' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        raw_url="${{ inputs.callback_url }}"
-        url="$(printf '%s' "$raw_url" | tr -d '\r')"
-        echo "::add-mask::$url"
-        payload='{"status":"running"}'
-        http_code=$(
-          curl -sS -o /tmp/callback_resp_start.txt -w "%{http_code}" \
-            -H "Content-Type: application/json" \
-            -X POST "$url" \
-            --data "$payload"
-        ) || http_code=0
-        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
-          echo "::warning::开始回调返回非 2xx 状态码: ${http_code}"
-        fi
-        rm -f /tmp/callback_resp_start.txt || true
-
-    - name: 克隆目标项目
-      shell: bash
-      env:
-        REPO_OWNER: ${{ github.event.inputs.repo_owner }}
-        REPO_NAME: ${{ github.event.inputs.repo_name }}
-        BRANCH: ${{ github.event.inputs.branch }}
-      run: |
-        if [ -n "${GH_TOKEN:-}" ]; then
-          echo "::add-mask::${GH_TOKEN}"
-        fi
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-
-        REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
-        if [ -n "${GH_TOKEN:-}" ]; then
-          REPO_WITH_AUTH=$(echo "$REPO_URL" | sed -E "s#https://#https://${GH_TOKEN}@#")
-          git clone -q "$REPO_WITH_AUTH" target-project
-          unset REPO_WITH_AUTH
-        else
-          git clone -q "$REPO_URL" target-project
-        fi
-
-        cd target-project
-        git checkout "${BRANCH}"
+    - name: 检出工作流仓库
+      uses: actions/checkout@v4
 
     - name: 安装 Bun
       uses: oven-sh/setup-bun@v1
@@ -131,147 +70,186 @@ jobs:
       run: bun --version
 
     - name: 安装工作流依赖
-      run: |
-        bun add crypto-js child_process
+      run: bun add crypto-js child_process
 
+    - name: 回调（开始 running）
+      if: ${{ inputs.callback_url != '' }}
+      shell: bash
+      run: |
+        URL="${{ inputs.callback_url }}"
+        URL="$(printf '%s' "$URL" | tr -d '\r')"
+        echo "::add-mask::$URL"
+        curl -sS -o /tmp/cb_start.txt -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -X POST "$URL" \
+          --data '{"status":"running"}' || true
+        rm -f /tmp/cb_start.txt || true
+
+    - name: 克隆目标项目
+      shell: bash
+      run: |
+        set -euo pipefail
+        REPO_OWNER='${{ inputs.repo_owner }}'
+        REPO_NAME='${{ inputs.repo_name }}'
+        BRANCH='${{ inputs.branch }}'
+
+        if [ -n "${GH_TOKEN:-}" ]; then echo "::add-mask::${GH_TOKEN}"; fi
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+
+        REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
+        if [ -n "${GH_TOKEN:-}" ]; then
+          AUTH_URL=$(echo "$REPO_URL" | sed -E "s#https://#https://${GH_TOKEN}@#")
+          git clone -q "$AUTH_URL" target-project
+          unset AUTH_URL
+        else
+          git clone -q "$REPO_URL"
+          mv "${REPO_NAME}" target-project
+        fi
+        cd target-project
+        git checkout "${BRANCH}"
+        
     - name: 安装依赖
       working-directory: target-project
-      run: |
-        bun install
+      run: bun install
 
     - name: 解密并设置环境变量（隐藏写入）
-      if: ${{ github.event.inputs.env_vars != '' }}
+      if: ${{ inputs.env_vars != '' }}
       working-directory: target-project
       shell: bash
       env:
-        ENCRYPTED_ENV: ${{ github.event.inputs.env_vars }}
+        ENCRYPTED_ENV: ${{ inputs.env_vars }}
       run: |
         set -euo pipefail
         ENV_FILE=".env"
-        TEMP_ENV_FILE=$(mktemp)
-
-        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${GH_TOKEN:-}" "$TEMP_ENV_FILE"
-
+        TMP=$(mktemp)
+        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${GH_TOKEN:-}" "$TMP"
         while IFS= read -r line || [[ -n "$line" ]]; do
-          [[ -z "$line" ]] && continue
-          [[ "$line" =~ ^# ]] && continue
+          [[ -z "$line" || "$line" =~ ^# ]] && continue
           if [[ "$line" == *=* ]]; then
-            key="${line%%=*}"
-            val="${line#*=}"
-            val_stripped="${val%\"}"; val_stripped="${val_stripped#\"}"
-            val_stripped="${val_stripped%\'}"; val_stripped="${val_stripped#\'}"
-            [[ -n "$val_stripped" ]] && echo "::add-mask::$val_stripped"
-            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+            k="${line%%=*}"; v="${line#*=}"
+            scrub="${v%\"}"; scrub="${scrub#\"}"; scrub="${scrub%\'}"; scrub="${scrub#\'}"
+            [[ -n "$scrub" ]] && echo "::add-mask::$scrub"
+            printf '%s=%s\n' "$k" "$v" >> "$GITHUB_ENV"
           fi
-        done < "$TEMP_ENV_FILE"
+        done < "$TMP"
+        cp "$TMP" "$ENV_FILE"
+        rm -f "$TMP"
 
-        cp "$TEMP_ENV_FILE" "$ENV_FILE"
-        rm -f "$TEMP_ENV_FILE"
-
-    - name: 执行命令（分号分隔）
+    - name: 执行命令（; 分隔）
       working-directory: target-project
       shell: bash
       run: |
         set -euo pipefail
-        CURRENT_DIR=$(pwd)
-        CMDS_STR=$(printf '%s' "${{ github.event.inputs.commands }}" | tr -d '\r')
-        IFS=';' read -ra COMMANDS <<< "$CMDS_STR"
-        for cmd in "${COMMANDS[@]}"; do
-          cmd="$(echo "$cmd" | xargs)"
-          [ -z "$cmd" ] && continue
-          cd "$CURRENT_DIR" && bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd" "$CURRENT_DIR"
+        BASE=$(pwd)
+        CMDS=$(printf '%s' "${{ inputs.commands }}" | tr -d '\r')
+        IFS=';' read -ra ARR <<< "$CMDS"
+        for cmd in "${ARR[@]}"; do
+          cmd="$(echo "$cmd" | xargs)"; [ -z "$cmd" ] && continue
+          cd "$BASE" && bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd" "$BASE"
         done
 
-    - name: 处理输出（分号分隔）
+    - name: 汇总输出 → 单一 ZIP
       working-directory: target-project
       shell: bash
       run: |
         set -euo pipefail
-        PATHS_STR=$(printf '%s' "${{ github.event.inputs.output_paths }}" | tr -d '\r')
-        IFS=';' read -ra PATHS <<< "$PATHS_STR"
+        TS=$(date +"%Y%m%d-%H%M%S")
+        ZIP_NAME="build-$TS"
+        ZIP_FILE="$ZIP_NAME.zip"
 
-        ARTIFACTS_LIST=""
-        CLEANED_LINES=""
-        for item in "${PATHS[@]}"; do
-          item="$(echo "$item" | xargs)"
-          [ -z "$item" ] && continue
-          if [ -z "$ARTIFACTS_LIST" ]; then
-            ARTIFACTS_LIST="$item"
-          else
-            ARTIFACTS_LIST="$ARTIFACTS_LIST $item"
-          fi
-          CLEANED_LINES="${CLEANED_LINES}${item}"
-        done
-
-        TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-        ZIP_FILE="build-$TIMESTAMP.zip"
-
-        if [[ "${{ github.event.inputs.compress_artifacts }}" == "true" ]]; then
-          zip -r "$ZIP_FILE" $ARTIFACTS_LIST >/dev/null
-          echo "ARTIFACT_PATH=$ZIP_FILE" >> $GITHUB_ENV
-          echo "ARTIFACT_NAME=build-$TIMESTAMP" >> $GITHUB_ENV
-        else
-          echo "ARTIFACT_NAME=build-$TIMESTAMP" >> $GITHUB_ENV
-          {
-            echo "ARTIFACT_PATHS<<EOF"
-            printf '%s' "$CLEANED_LINES"
-            echo "EOF"
-          } >> $GITHUB_ENV
+        RAW=$(printf '%s' "${{ inputs.output_paths }}" | tr -d '\r')
+        IFS=';' read -ra PATHS <<< "$RAW"
+        readarray -t PTHS < <(for p in "${PATHS[@]}"; do echo "$p" | xargs; done | sed '/^$/d')
+        if [ "${#PTHS[@]}" -eq 0 ]; then
+          echo "未提供有效输出路径" >&2
+          exit 1
         fi
 
-    - name: 上传压缩输出
+        for p in "${PTHS[@]}"; do
+          if [ -d "$p" ]; then
+            (cd "$(dirname "$p")" && zip -r "$OLDPWD/$ZIP_FILE" "$(basename "$p")" >/dev/null)
+          elif [ -f "$p" ]; then
+            zip -j "$ZIP_FILE" "$p" >/dev/null 2>/dev/null || zip "$ZIP_FILE" "$p" >/dev/null
+          fi
+        done
+
+        if command -v stat >/dev/null 2>&1; then
+          SIZE=$(stat -c%s "$ZIP_FILE" 2>/dev/null || stat -f%z "$ZIP_FILE" 2>/dev/null || wc -c <"$ZIP_FILE")
+        else
+          SIZE=$(wc -c <"$ZIP_FILE")
+        fi
+        echo "ARTIFACT_NAME=$ZIP_NAME" >> $GITHUB_ENV
+        echo "ARTIFACT_PATH=$ZIP_FILE" >> $GITHUB_ENV
+        echo "ARTIFACT_SIZE=$SIZE" >> $GITHUB_ENV
+
+    - name: 上传产物（单一 ZIP）
+      id: upload_art
       uses: actions/upload-artifact@v4
-      if: ${{ github.event.inputs.compress_artifacts == 'true' }}
       with:
         name: ${{ env.ARTIFACT_NAME }}
         path: target-project/${{ env.ARTIFACT_PATH }}
         if-no-files-found: error
 
-    - name: 上传未压缩输出
-      uses: actions/upload-artifact@v4
-      if: ${{ github.event.inputs.compress_artifacts != 'true' }}
-      with:
-        name: ${{ env.ARTIFACT_NAME }}
-        path: |
-          ${{ env.ARTIFACT_PATHS }}
-        path-pattern: "target-project/{0}"
-        if-no-files-found: error
-
-    - name: 回调（结束：success/failed/cancelled）
+    - name: 回调（结束）
       if: ${{ always() && inputs.callback_url != '' }}
       shell: bash
+      env:
+        OWNER: ${{ github.repository_owner }}
+        REPO: ${{ github.event.repository.name }}
+        RUN_ID: ${{ github.run_id }}
       run: |
         set -euo pipefail
+
         case "${{ job.status }}" in
-          success)   STATUS="success" ;;
-          failure)   STATUS="failed" ;;
+          success) STATUS="success" ;;
+          failure) STATUS="failed" ;;
           cancelled) STATUS="cancelled" ;;
-          *)         STATUS="failed" ;;
+          *) STATUS="failed" ;;
         esac
 
-        raw_url="${{ inputs.callback_url }}"
-        url="$(printf '%s' "$raw_url" | tr -d '\r')"
-        echo "::add-mask::$url"
+        RUN_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
 
-        GITHUB_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        ARTIFACTS_URL="${GITHUB_RUN_URL}#artifacts"
+        ART_ID="${{ steps.upload_art.outputs.artifact-id }}"
+        ART_URL="${{ steps.upload_art.outputs.artifact-url }}"
+        NAME="${{ env.ARTIFACT_NAME }}"
+        SIZE="${{ env.ARTIFACT_SIZE }}"
 
-        payload=$(
-          jq -n \
-            --arg status "$STATUS" \
-            --arg run_url "$GITHUB_RUN_URL" \
-            --arg artifacts_url "$ARTIFACTS_URL" \
-            '{status: $status, github_run_url: $run_url, artifacts_url: $artifacts_url}'
-        )
+        # archive_url：使用 v4 输出的 artifact-url（原始 URL）
+        ARCHIVE_URL="${ART_URL:-}"
 
-        http_code=$(
-          curl -sS -o /tmp/callback_resp_end.txt -w "%{http_code}" \
-            -H "Content-Type: application/json" \
-            -X POST "$url" \
-            --data "$payload"
-        ) || http_code=0
-
-        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
-          echo "::warning::结束回调返回非 2xx 状态码: ${http_code}"
+        # download_url：用规则拼接 UI 地址
+        DOWNLOAD_URL=""
+        if [ -n "$ART_ID" ]; then
+          DOWNLOAD_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts/${ART_ID}"
         fi
+
+        artifacts=$(jq -n \
+          --arg id "${ART_ID:-0}" \
+          --arg name "$NAME" \
+          --arg size "${SIZE:-0}" \
+          --arg arch "${ARCHIVE_URL:-}" \
+          --arg down "${DOWNLOAD_URL:-}" \
+          '[{
+            id: ($id|tonumber),
+            name: $name,
+            size_in_bytes: ($size|tonumber),
+            archive_url: $arch,
+            download_url: $down
+          }]')
+
+        CB="${{ inputs.callback_url }}"
+        CB="$(printf '%s' "$CB" | tr -d '\r')"
+        echo "::add-mask::$CB"
+
+        payload=$(jq -n \
+          --arg status "$STATUS" \
+          --arg run_url "$RUN_URL" \
+          --argjson artifacts "$artifacts" \
+          '{status: $status, github_run_url: $run_url, artifacts: $artifacts}')
+
+        curl -sS -o /tmp/callback_resp_end.txt -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -X POST "$CB" \
+          --data "$payload" || true
         rm -f /tmp/callback_resp_end.txt || true
