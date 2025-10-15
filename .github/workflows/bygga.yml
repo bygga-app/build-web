@@ -33,11 +33,11 @@ on:
         description: '【加密】环境变量密文（decrypt-env.ts 可识别的密文字符串）'
         required: false
       github_token:
-        description: 'Base64 编码的 GitHub Token（不回退，留空则不使用令牌）'
+        description: 'Base64 编码的 GitHub Token'
         required: false
         default: ''
       callback_url:
-        description: '（可选）回调通知地址，结束后将以 POST JSON 调用'
+        description: '回调通知地址（可选）'
         required: false
         default: ''
 
@@ -54,26 +54,21 @@ jobs:
     - name: 检出构建工具仓库
       uses: actions/checkout@v4
 
-    - name: 解析 github_token（Base64）为 GH_TOKEN（无任何回退）
+    - name: 准备 GH_TOKEN
       shell: bash
-      env:
-        INPUT_GITHUB_TOKEN_B64: ${{ inputs.github_token }}
       run: |
-        set -e
-        if [[ -n "${INPUT_GITHUB_TOKEN_B64}" ]]; then
-          cleaned=$(printf '%s' "${INPUT_GITHUB_TOKEN_B64}" | tr -d '\r\n ')
-          if decoded=$(printf '%s' "$cleaned" | base64 -d 2>/dev/null); then
-            if [[ -n "$decoded" ]]; then
-              echo "::add-mask::$decoded"
-              echo "GH_TOKEN=$decoded" >> "$GITHUB_ENV"
-            else
-              echo "::warning::提供的 github_token Base64 解码后为空，未设置 GH_TOKEN。"
-            fi
-          else
-            echo "::warning::提供的 github_token 不是有效的 Base64 字符串，未设置 GH_TOKEN。"
+        set -euo pipefail
+        raw_b64="${{ inputs.github_token }}"
+        if [[ -n "$raw_b64" ]]; then
+          cleaned=$(printf '%s' "$raw_b64" | tr -d '\r\n ')
+          echo "::add-mask::$cleaned"
+          decoded=$(printf '%s' "$cleaned" | base64 -d 2>/dev/null || true)
+          if [[ -n "$decoded" ]]; then
+            echo "::add-mask::$decoded"
+            printf 'GH_TOKEN=%s\n' "$decoded" >> "$GITHUB_ENV"
+            unset decoded
           fi
-        else
-          echo "未提供 github_token，未设置 GH_TOKEN（将以匿名方式克隆公共仓库）。"
+          unset cleaned raw_b64
         fi
 
     - name: 克隆目标项目
@@ -90,14 +85,11 @@ jobs:
         git config --global user.email "actions@github.com"
 
         REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
-
         if [ -n "${GH_TOKEN}" ]; then
           REPO_WITH_AUTH=$(echo "$REPO_URL" | sed -E "s#https://#https://${GH_TOKEN}@#")
-          echo "正在克隆（带认证）: ${REPO_OWNER}/${REPO_NAME} ..."
           git clone -q "$REPO_WITH_AUTH" target-project
           unset REPO_WITH_AUTH
         else
-          echo "未设置 GH_TOKEN，将以匿名方式克隆（仅公共仓库）: ${REPO_OWNER}/${REPO_NAME} ..."
           git clone -q "$REPO_URL" target-project
         fi
 
@@ -114,59 +106,66 @@ jobs:
 
     - name: 安装工作流依赖
       run: |
-        echo "安装工作流所需的依赖包..."
         bun add crypto-js child_process
 
     - name: 安装依赖
       working-directory: target-project
       run: |
-        echo "使用 Bun 安装依赖..."
         bun install
 
-    - name: 解密并设置环境变量
+    - name: 解密并设置环境变量（隐藏写入）
       if: ${{ github.event.inputs.env_vars != '' }}
       working-directory: target-project
+      shell: bash
+      env:
+        ENCRYPTED_ENV: ${{ github.event.inputs.env_vars }}
       run: |
-        echo "解密环境变量..."
+        set -e
         ENV_FILE=".env"
         TEMP_ENV_FILE=$(mktemp)
 
-        bun $GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts "${{ github.event.inputs.env_vars }}" "${GH_TOKEN}" "$TEMP_ENV_FILE"
-        if [ $? -ne 0 ]; then
-          echo "环境变量解密失败"
-          exit 1
-        fi
+        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${GH_TOKEN}" "$TEMP_ENV_FILE"
 
-        cat "$TEMP_ENV_FILE" >> $GITHUB_ENV
-        cat "$TEMP_ENV_FILE" > "$ENV_FILE"
-        echo "已成功解密并设置环境变量"
-        rm "$TEMP_ENV_FILE"
+        # 将 .env 内容逐行写入 GITHUB_ENV，并为每个 VALUE 做 add-mask
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          [[ -z "$line" ]] && continue
+          [[ "$line" =~ ^# ]] && continue
+          if [[ "$line" == *=* ]]; then
+            key="${line%%=*}"
+            val="${line#*=}"
+            # 去掉可能的包裹引号（不影响 .env 文件，仅用于掩码一致性）
+            val_stripped="${val%\"}"
+            val_stripped="${val_stripped#\"}"
+            val_stripped="${val_stripped%\'}"
+            val_stripped="${val_stripped#\'}"
+            [[ -n "$val_stripped" ]] && echo "::add-mask::$val_stripped"
+            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+          fi
+        done < "$TEMP_ENV_FILE"
+
+        # 写入项目 .env（不打印内容）
+        cp "$TEMP_ENV_FILE" "$ENV_FILE"
+        rm -f "$TEMP_ENV_FILE"
 
     - name: 执行命令（分号分隔）
       working-directory: target-project
       shell: bash
       run: |
-        echo "执行命令（以 ; 分隔）..."
+        set -e
         CURRENT_DIR=$(pwd)
         CMDS_STR=$(printf '%s' "${{ github.event.inputs.commands }}" | tr -d '\r')
         IFS=';' read -ra COMMANDS <<< "$CMDS_STR"
         for cmd in "${COMMANDS[@]}"; do
           cmd="$(echo "$cmd" | xargs)"
           [ -z "$cmd" ] && continue
-          echo "执行: $cmd"
           cd "$CURRENT_DIR" && bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd" "$CURRENT_DIR"
-          if [ $? -ne 0 ]; then
-            echo "命令执行失败: $cmd"
-            exit 1
-          fi
         done
-        echo "所有命令已成功执行"
 
     - name: 处理输出（分号分隔）
       working-directory: target-project
       shell: bash
       run: |
-        echo "处理输出（以 ; 分隔）..."
+        set -e
         sudo apt-get update && sudo apt-get install -y zip
 
         PATHS_STR=$(printf '%s' "${{ github.event.inputs.output_paths }}" | tr -d '\r')
@@ -189,13 +188,10 @@ jobs:
         ZIP_FILE="build-$TIMESTAMP.zip"
 
         if [[ "${{ github.event.inputs.compress_artifacts }}" == "true" ]]; then
-          echo "将以下路径打包到 $ZIP_FILE:"
-          printf '%s\n' "$CLEANED_LINES"
           zip -r "$ZIP_FILE" $ARTIFACTS_LIST
           echo "ARTIFACT_PATH=$ZIP_FILE" >> $GITHUB_ENV
           echo "ARTIFACT_NAME=build-$TIMESTAMP" >> $GITHUB_ENV
         else
-          echo "不压缩，使用原始路径上传输出"
           echo "ARTIFACT_NAME=build-$TIMESTAMP" >> $GITHUB_ENV
           {
             echo "ARTIFACT_PATHS<<EOF"
@@ -224,32 +220,19 @@ jobs:
 
     - name: 结束通知
       run: |
-        echo "您可以在 GitHub Actions 运行页面的 'Artifacts' 部分下载输出"
-        echo "输出（原始输入，; 分隔）：${{ github.event.inputs.output_paths }}"
-        if [[ "${{ github.event.inputs.compress_artifacts }}" == "true" ]]; then
-          echo "输出已压缩为 ZIP 文件"
-        else
-          echo "输出以原始目录结构上传"
-        fi
+        echo "Artifacts 已生成"
 
     - name: 回调通知
       if: ${{ always() && inputs.callback_url != '' }}
       shell: bash
       env:
         CALLBACK_URL: ${{ inputs.callback_url }}
-        JOB_STATUS: ${{ job.status }} # success | failure | cancelled
+        JOB_STATUS: ${{ job.status }}
       run: |
-        echo "发送回调到: ${CALLBACK_URL}"
-
         FINISH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
         start_ts=$(date -u -d "${RUN_STARTED_AT}" +%s 2>/dev/null || echo 0)
         end_ts=$(date -u -d "${FINISH_TIME}" +%s)
-        if [ "$start_ts" -gt 0 ]; then
-          DURATION_SEC=$(( end_ts - start_ts ))
-        else
-          DURATION_SEC=0
-        fi
+        if [ "$start_ts" -gt 0 ]; then DURATION_SEC=$(( end_ts - start_ts )); else DURATION_SEC=0; fi
 
         payload=$(
           jq -n \
@@ -285,20 +268,11 @@ jobs:
             }'
         )
 
-        echo "回调载荷："
-        echo "$payload" | jq .
+        curl -sS -o /tmp/callback_resp.txt -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -X POST "${CALLBACK_URL}" \
+          --data "$payload" >/tmp/callback_code.txt
 
-        http_code=$(
-          curl -sS -o /tmp/callback_resp.txt -w "%{http_code}" \
-            -H "Content-Type: application/json" \
-            -X POST "${CALLBACK_URL}" \
-            --data "$payload"
-        )
-
+        http_code=$(cat /tmp/callback_code.txt || echo 0)
         echo "回调响应码: $http_code"
-        echo "回调响应体:"
         cat /tmp/callback_resp.txt || true
-
-        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
-          echo "::warning::回调返回非 2xx 状态码: ${http_code}"
-        fi
