@@ -69,6 +69,9 @@ jobs:
     - name: 显示 Bun 版本
       run: bun --version
 
+    - name: 安装 Rust
+      uses: dtolnay/rust-toolchain@stable
+      
     - name: 安装工作流依赖
       run: bun add crypto-js child_process
 
