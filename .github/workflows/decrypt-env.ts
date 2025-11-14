@@ -74,7 +74,8 @@ function main() {
   const key = args[1];
   const outputFile = args[2];
 
-  if (!encryptedData || !key) {
+  if (!encryptedData || !key || !outputFile) {
+    console.error('错误:缺少必需参数 (加密数据, 密钥, 输出文件路径)');
     process.exit(1);
   }
 
@@ -85,25 +86,28 @@ function main() {
       throw new Error('解密结果为空');
     }
 
-    // 解析JSON格式的环境变量
-    const envVars = JSON.parse(decrypted);
+    let output: string;
 
-    // 检查是否为对象
-    if (typeof envVars !== 'object' || envVars === null) {
-      throw new Error('解密后的数据不是有效的环境变量对象');
+    // 尝试解析为JSON
+    try {
+      const envVars = JSON.parse(decrypted);
+
+      // 如果是对象,转换为环境变量格式
+      if (typeof envVars === 'object' && envVars !== null && !Array.isArray(envVars)) {
+        output = Object.entries(envVars).map(([key, value]) => {
+          return `${key}=${value}`;
+        }).join('\n');
+      } else {
+        // 如果不是对象,直接输出原始字符串
+        output = decrypted;
+      }
+    } catch {
+      // 如果不是JSON,直接输出原始解密字符串
+      output = decrypted;
     }
 
-    // 输出环境变量
-    const output = Object.entries(envVars).map(([key, value]) => {
-      return `${key}=${value}`;
-    }).join('\n');
-
-    if (outputFile) {
-      writeFileSync(outputFile, output);
-    } else {
-      // 否则输出到标准输出
-      console.log(output);
-    }
+    // 写入到输出文件(安全考虑:不输出到标准输出)
+    writeFileSync(outputFile, output);
 
   } catch (error) {
     console.error('处理环境变量失败:', error instanceof Error ? error.message : String(error));
