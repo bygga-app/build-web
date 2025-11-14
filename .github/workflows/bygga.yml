@@ -24,6 +24,7 @@ on:
       github_token:
         required: false
         default: ''
+        description: 'Base64 encoded GitHub token (will be masked in logs)'
       callback_url:
         required: false
         default: ''
@@ -46,15 +47,27 @@ jobs:
 
     - name: 安装工具并处理 Token
       shell: bash
-      env:
-        GH_TOKEN_INPUT: ${{ inputs.github_token }}
       run: |
         set +x
         set -euo pipefail
+        # 安装系统工具
+        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+          sudo apt-get -qq update 2>/dev/null || true
+          sudo apt-get -qq install -y jq zip >/dev/null 2>&1 || true
+        elif [[ "$OSTYPE" == "darwin"* ]]; then
+          command -v jq &>/dev/null || brew install jq >/dev/null 2>&1 || true
+          command -v zip &>/dev/null || brew install zip >/dev/null 2>&1 || true
+        elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+          command -v jq &>/dev/null || choco install jq -y >/dev/null 2>&1 || true
+        fi
 
-        if [[ -n "${GH_TOKEN_INPUT:-}" ]]; then
-          echo "::add-mask::${GH_TOKEN_INPUT}"
-          CLEAN=$(printf '%s' "${GH_TOKEN_INPUT}" | tr -d '\r\n ')
+        echo "::add-mask::${{ inputs.github_token }}"
+        echo "::add-mask::${{ inputs.env_vars }}"
+        echo "::add-mask::${{ inputs.callback_url }}"
+        TOKEN_INPUT='${{ inputs.github_token }}'
+
+        if [[ -n "${TOKEN_INPUT}" ]]; then
+          CLEAN=$(printf '%s' "${TOKEN_INPUT}" | tr -d '\r\n ')
           echo "::add-mask::${CLEAN}"
 
           DEC=$(printf '%s' "${CLEAN}" | base64 -d 2>/dev/null || \
@@ -67,16 +80,6 @@ jobs:
             echo "::add-mask::${DEC}"
             printf 'GH_TOKEN=%s\n' "$DEC" >> "$GITHUB_ENV"
           fi
-        fi
-
-        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-          sudo apt-get -qq update 2>/dev/null || true
-          sudo apt-get -qq install -y jq zip >/dev/null 2>&1 || true
-        elif [[ "$OSTYPE" == "darwin"* ]]; then
-          command -v jq &>/dev/null || brew install jq >/dev/null 2>&1 || true
-          command -v zip &>/dev/null || brew install zip >/dev/null 2>&1 || true
-        elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
-          command -v jq &>/dev/null || choco install jq -y >/dev/null 2>&1 || true
         fi
 
     - name: 安装 Bun
@@ -97,7 +100,6 @@ jobs:
         CALLBACK_URL: ${{ inputs.callback_url }}
       run: |
         URL=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
-        echo "::add-mask::${URL}"
         curl -sS -w "%{http_code}" \
           -H "Content-Type: application/json" \
           -X POST "${URL}" \
@@ -127,16 +129,18 @@ jobs:
       working-directory: target-project
       run: bun install
 
-    - name: 解密并设置环境变量（隐藏写入）
+    - name: 解密并设置环境变量(隐藏写入)
       if: ${{ inputs.env_vars != '' }}
       working-directory: target-project
       shell: bash
-      env:
-        ENCRYPTED_ENV: ${{ inputs.env_vars }}
       run: |
         set -euo pipefail
+
         ENV_FILE=".env"
         TMP=$(mktemp)
+
+        ENCRYPTED_ENV='${{ inputs.env_vars }}'
+
         bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${GH_TOKEN:-}" "$TMP"
         while IFS= read -r line || [[ -n "$line" ]]; do
           [[ -z "$line" || "$line" =~ ^# ]] && continue
@@ -245,7 +249,6 @@ jobs:
           }]')
 
         CB=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
-        echo "::add-mask::${CB}"
 
         payload=$(jq -n \
           --arg status "$STATUS" \
