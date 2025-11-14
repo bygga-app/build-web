@@ -24,7 +24,6 @@ on:
       github_token:
         required: false
         default: ''
-        description: 'Base64 encoded GitHub token (will be masked in logs)'
       callback_url:
         required: false
         default: ''
@@ -32,6 +31,9 @@ on:
 permissions:
   contents: read
   actions: read
+
+env:
+  SALT: ${{ secrets.SALT }}
 
 jobs:
   build:
@@ -45,12 +47,10 @@ jobs:
       run: |
         echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
-    - name: 安装工具并处理 Token
-      shell: bash
+    - name: 安装工具
       run: |
-        set +x
         set -euo pipefail
-        # 安装系统工具
+
         if [[ "$OSTYPE" == "linux-gnu"* ]]; then
           sudo apt-get -qq update 2>/dev/null || true
           sudo apt-get -qq install -y jq zip >/dev/null 2>&1 || true
@@ -59,27 +59,6 @@ jobs:
           command -v zip &>/dev/null || brew install zip >/dev/null 2>&1 || true
         elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
           command -v jq &>/dev/null || choco install jq -y >/dev/null 2>&1 || true
-        fi
-
-        echo "::add-mask::${{ inputs.github_token }}"
-        echo "::add-mask::${{ inputs.env_vars }}"
-        echo "::add-mask::${{ inputs.callback_url }}"
-        TOKEN_INPUT='${{ inputs.github_token }}'
-
-        if [[ -n "${TOKEN_INPUT}" ]]; then
-          CLEAN=$(printf '%s' "${TOKEN_INPUT}" | tr -d '\r\n ')
-          echo "::add-mask::${CLEAN}"
-
-          DEC=$(printf '%s' "${CLEAN}" | base64 -d 2>/dev/null || \
-                printf '%s' "${CLEAN}" | base64 --decode 2>/dev/null || \
-                printf '%s' "${CLEAN}" | base64 -D 2>/dev/null || \
-                python3 -c "import sys,base64; print(base64.b64decode(sys.stdin.read()).decode())" 2>/dev/null <<< "${CLEAN}" || \
-                python -c "import sys,base64; print(base64.b64decode(sys.stdin.read()).decode())" 2>/dev/null <<< "${CLEAN}" || echo "")
-
-          if [[ -n "$DEC" ]]; then
-            echo "::add-mask::${DEC}"
-            printf 'GH_TOKEN=%s\n' "$DEC" >> "$GITHUB_ENV"
-          fi
         fi
 
     - name: 安装 Bun
@@ -93,13 +72,34 @@ jobs:
     - name: 安装工作流依赖
       run: bun add crypto-js child_process
 
+    - name: 解密 GitHub Token
+      if: ${{ inputs.github_token != '' }}
+      env:
+        GH_TOKEN_INPUT: ${{ inputs.github_token }}
+      run: |
+        set +x
+        set -euo pipefail
+
+        echo "::add-mask::${GH_TOKEN_INPUT}"
+
+        # 使用 decrypt-env.ts 解密 github_token
+        TMP=$(mktemp)
+        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${GH_TOKEN_INPUT}" "${SALT:-}" "$TMP"
+        DECRYPTED_TOKEN=$(cat "$TMP")
+        rm -f "$TMP"
+
+        if [[ -n "$DECRYPTED_TOKEN" ]]; then
+          echo "::add-mask::${DECRYPTED_TOKEN}"
+          printf 'GH_TOKEN=%s\n' "$DECRYPTED_TOKEN" >> "$GITHUB_ENV"
+        fi
+
     - name: 回调（开始 running）
       if: ${{ inputs.callback_url != '' }}
-      shell: bash
       env:
         CALLBACK_URL: ${{ inputs.callback_url }}
       run: |
         URL=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
+        echo "::add-mask::${URL}"
         curl -sS -w "%{http_code}" \
           -H "Content-Type: application/json" \
           -X POST "${URL}" \
@@ -129,19 +129,17 @@ jobs:
       working-directory: target-project
       run: bun install
 
-    - name: 解密并设置环境变量(隐藏写入)
+    - name: 解密并设置环境变量（隐藏写入）
       if: ${{ inputs.env_vars != '' }}
       working-directory: target-project
       shell: bash
+      env:
+        ENCRYPTED_ENV: ${{ inputs.env_vars }}
       run: |
         set -euo pipefail
-
         ENV_FILE=".env"
         TMP=$(mktemp)
-
-        ENCRYPTED_ENV='${{ inputs.env_vars }}'
-
-        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${GH_TOKEN:-}" "$TMP"
+        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${SALT:-}" "$TMP"
         while IFS= read -r line || [[ -n "$line" ]]; do
           [[ -z "$line" || "$line" =~ ^# ]] && continue
           if [[ "$line" == *=* ]]; then
@@ -249,6 +247,7 @@ jobs:
           }]')
 
         CB=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
+        echo "::add-mask::${CB}"
 
         payload=$(jq -n \
           --arg status "$STATUS" \
