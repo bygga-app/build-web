@@ -47,7 +47,17 @@ jobs:
       run: |
         echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
-    - name: 安装工具
+    - name: 安装 Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: 安装 Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: 初始化工作环境
+      env:
+        GH_TOKEN_INPUT: ${{ inputs.github_token }}
       run: |
         set -euo pipefail
 
@@ -61,36 +71,20 @@ jobs:
           command -v jq &>/dev/null || choco install jq -y >/dev/null 2>&1 || true
         fi
 
-    - name: 安装 Bun
-      uses: oven-sh/setup-bun@v1
-      with:
-        bun-version: latest
+        bun add crypto-js child_process
 
-    - name: 安装 Rust
-      uses: dtolnay/rust-toolchain@stable
+        if [[ -n "${GH_TOKEN_INPUT}" ]]; then
+          set +x
+          echo "::add-mask::${GH_TOKEN_INPUT}"
+          TMP=$(mktemp)
+          bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${GH_TOKEN_INPUT}" "${SALT:-}" "$TMP"
+          DECRYPTED_TOKEN=$(cat "$TMP")
+          rm -f "$TMP"
 
-    - name: 安装工作流依赖
-      run: bun add crypto-js child_process
-
-    - name: 解密 GitHub Token
-      if: ${{ inputs.github_token != '' }}
-      env:
-        GH_TOKEN_INPUT: ${{ inputs.github_token }}
-      run: |
-        set +x
-        set -euo pipefail
-
-        echo "::add-mask::${GH_TOKEN_INPUT}"
-
-        # 使用 decrypt-env.ts 解密 github_token
-        TMP=$(mktemp)
-        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${GH_TOKEN_INPUT}" "${SALT:-}" "$TMP"
-        DECRYPTED_TOKEN=$(cat "$TMP")
-        rm -f "$TMP"
-
-        if [[ -n "$DECRYPTED_TOKEN" ]]; then
-          echo "::add-mask::${DECRYPTED_TOKEN}"
-          printf 'GH_TOKEN=%s\n' "$DECRYPTED_TOKEN" >> "$GITHUB_ENV"
+          if [[ -n "$DECRYPTED_TOKEN" ]]; then
+            echo "::add-mask::${DECRYPTED_TOKEN}"
+            printf 'GH_TOKEN=%s\n' "$DECRYPTED_TOKEN" >> "$GITHUB_ENV"
+          fi
         fi
 
     - name: 回调（开始 running）
@@ -129,7 +123,7 @@ jobs:
       working-directory: target-project
       run: bun install
 
-    - name: 解密并设置环境变量（隐藏写入）
+    - name: 配置项目环境
       if: ${{ inputs.env_vars != '' }}
       working-directory: target-project
       shell: bash
